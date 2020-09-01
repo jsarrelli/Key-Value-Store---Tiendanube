@@ -1,8 +1,11 @@
 package kvstore
 
 import akka.actor.{Actor, ActorRef, Props, Timers}
+import akka.event.Logging.InfoLevel
+import akka.event.LoggingReceive
 
 import scala.concurrent.duration._
+import scala.language.postfixOps
 
 object Replicator {
 
@@ -38,7 +41,7 @@ class Replicator(val replica: ActorRef) extends Actor with Timers {
     ret
   }
 
-  def receive: Receive = {
+  def receive: Receive = LoggingReceive(InfoLevel) {
     case op: Replicate => handleReplicate(op, sender)
     case ack: SnapshotAck => handleSnapshotAck(ack)
     case msg: RetryPendingSnapshot => retryPendingSnapshots(msg)

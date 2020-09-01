@@ -7,7 +7,7 @@ import akka.event.LoggingReceive
 import kvstore.Arbiter._
 import kvstore.Replicator.{Replicate, Replicated, Snapshot, SnapshotAck}
 
-import scala.collection.mutable
+import scala.collection.{immutable, mutable}
 import scala.concurrent.duration._
 import scala.language.postfixOps
 
@@ -82,7 +82,7 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
     case JoinedSecondary => context.become(replica)
   }
 
-  val leader: Receive = LoggingReceive {
+  val leader: Receive = LoggingReceive(InfoLevel) {
     case msg: Insert => handleUpdateMsg(msg, sender)
     case msg: Remove => handleUpdateMsg(msg, sender)
     case msg: Get => handleGet(msg, sender)
@@ -93,13 +93,10 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
     case Replicas(replicas) => handleReplicasMsg(replicas)
   }
 
-  val replica: Receive = {
-    case op: Get => handleGet(op, sender)
-    case op: Snapshot if op.seq < expectedSequence =>
-      sender ! SnapshotAck(op.key, op.seq)
-    case op: Snapshot if expectedSequence == op.seq =>
-      handleSnapshot(op, sender)
-    case op: Persisted => handlePersistedReplica(op)
+  val replica: Receive = LoggingReceive(InfoLevel) {
+    case msg: Get => handleGet(msg, sender)
+    case msg: Snapshot => handleSnapshot(msg, sender)
+    case msg: Persisted => handlePersistedReplica(msg)
     case msg: RetryPersistence => handleRetryPersistence(msg)
   }
 
@@ -131,7 +128,6 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
       pendingReplicatesAck += (replicateMsg.id -> replicators.map((_, sender)).to(collection.mutable.Set))
 
     replicators foreach (_ ! replicateMsg)
-
   }
 
   private def handleGet(op: Get, sender: ActorRef): Unit = {
@@ -142,20 +138,37 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
     persistentService ! Persist(msg.key, msg.value, msg.id)
   }
 
-  private def handleSnapshot(op: Snapshot, replicator: ActorRef): Unit = {
-    op.valueOption match {
-      case Some(value) => kv += (op.key -> value)
-      case None => kv -= op.key
+  private def handleSnapshot(msg: Snapshot, replicator: ActorRef): Unit = {
+    msg.seq match {
+      case seq if seq < expectedSequence =>
+        sender ! SnapshotAck(msg.key, msg.seq)
+      case seq if seq == expectedSequence =>
+        msg.valueOption match {
+          case Some(value) => kv += (msg.key -> value)
+          case None => kv -= msg.key
+        }
+        pendingPersistedAck += (msg.seq -> replicator)
+        persistentService ! Persist(msg.key, msg.valueOption, msg.seq)
+        val retryPersistenceMsg = RetryPersistence(msg.key, msg.valueOption, msg.seq)
+        timers.startTimerAtFixedRate(s"retryPersistence+${msg.seq}", retryPersistenceMsg, 100 milliseconds)
+      case _ =>
     }
-    pendingPersistedAck += (op.seq -> replicator)
-    persistentService ! Persist(op.key, op.valueOption, op.seq)
-    val retryPersistenceMsg = RetryPersistence(op.key, op.valueOption, op.seq)
-    timers.startTimerAtFixedRate(s"retryPersistence+${op.seq}", retryPersistenceMsg, 100 milliseconds)
   }
 
   private def handleReplicasMsg(replicas: Set[ActorRef]): Unit = {
     val stoppedReplicas = (secondaries.keys.toSet + self).diff(replicas)
     val newReplicas = replicas.diff(secondaries.keys.toSet + self)
+    val stoppedReplicators = secondaries.collect { case (replica, replicator) if stoppedReplicas.contains(replica) => replicator }.toSet
+
+    //remove replicators from the pendingReplicateList, and acknowledge that message if theres no one else to wait for
+    pendingReplicatesAck.foreach { case (key, pending) =>
+      val elementsToRemove = pending.filter { case (secondary, _) => stoppedReplicators.contains(secondary) }
+      pending --= elementsToRemove
+      if (pending.isEmpty) {
+        pendingReplicatesAck -= key
+        elementsToRemove.headOption.foreach { case (_, client) => client ! OperationAck(key) }
+      }
+    }
 
     //remove stopped replicas and stops their replicator
     stoppedReplicas.foreach { replica =>
@@ -164,10 +177,6 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
           secondaries -= replica
           context.stop(replicator)
           replicators -= replicator
-          pendingReplicatesAck.foreach { case (key, pending) =>
-            pending --= pending.filter { case (client, _) => client == replicator }
-            if (pending.isEmpty) pendingReplicatesAck -= key
-          }
       }
     }
 
@@ -184,7 +193,6 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
 
   private def handlePersistedLeader(persisted: Persisted): Unit = {
     timers.cancel(s"retryPersistence+${persisted.id}")
-    println(persisted.id)
     pendingPersistedAck.get(persisted.id) foreach { client =>
       if (!pendingReplicatesAck.contains(persisted.id)) {
         timers.cancel(s"checkGlobalAck+${persisted.id}")
@@ -207,12 +215,14 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
     pendingReplicatesAck.get(replicated.id).foreach { pendings =>
       pendings.find { case (client, _) => client == replicator }
         .foreach { element =>
-          val client = element._2
           pendings -= element
           if (pendings.isEmpty) {
-            timers.cancel(s"checkGlobalAck+${replicated.id}")
-            client ! OperationAck(replicated.id)
             pendingReplicatesAck -= replicated.id
+            if (!pendingPersistedAck.contains(replicated.id)) {
+              val client = element._2
+              timers.cancel(s"checkGlobalAck+${replicated.id}")
+              client ! OperationAck(replicated.id)
+            }
           }
         }
     }
@@ -221,10 +231,6 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
   private def handleCheckGlobalAck(ack: CheckGlobalAck): Unit = {
     if (pendingReplicatesAck.contains(ack.msgId) || pendingPersistedAck.contains(ack.msgId))
       ack.client ! OperationFailed(ack.msgId)
-    else{
-      println(ack.msgId)
-      ack.client ! OperationAck(ack.msgId)
-    }
     timers.cancel(s"retryPersistence+${ack.msgId}")
     pendingPersistedAck -= ack.msgId
     pendingReplicatesAck -= ack.msgId
