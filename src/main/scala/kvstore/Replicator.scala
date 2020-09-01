@@ -61,8 +61,8 @@ class Replicator(val replica: ActorRef) extends Actor with Timers {
 
   private def handleSnapshotAck(ack: SnapshotAck): Unit = {
     timers.cancel(s"retryPendingSnapshot-${ack.seq}")
-    pendingAcks.get(ack.seq) foreach { case (client, _) =>
-      client ! Replicated(ack.key, ack.seq)
+    pendingAcks.get(ack.seq) foreach { case (client, op) =>
+      client ! Replicated(ack.key, op.id)
     }
     pendingAcks -= ack.seq
   }
