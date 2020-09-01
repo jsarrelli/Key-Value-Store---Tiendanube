@@ -1,17 +1,13 @@
 package kvstore
 
-import akka.actor
 import akka.actor.SupervisorStrategy.Resume
-import akka.actor.{Actor, ActorRef, OneForOneStrategy, PoisonPill, Props, SupervisorStrategy, Timers}
-import akka.pattern.ask
+import akka.actor.{Actor, ActorRef, OneForOneStrategy, Props, SupervisorStrategy, Timers}
 import akka.util.Timeout
 import kvstore.Arbiter._
 import kvstore.Replicator.{Replicate, Replicated, Snapshot, SnapshotAck}
 
-import scala.collection.immutable.{AbstractSet, SortedSet}
 import scala.collection.mutable
 import scala.concurrent.duration._
-import scala.util.{Failure, Success}
 
 object Replica {
 
@@ -37,6 +33,10 @@ object Replica {
 
   case object RetryPending
 
+  case class RetryPersistence(key: String, value: Option[String], id: Long)
+
+  case class CheckGlobalAck(msgId: Long, client: ActorRef)
+
 
   def props(arbiter: ActorRef, persistenceProps: Props): Props = Props(new Replica(arbiter, persistenceProps))
 }
@@ -45,16 +45,17 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
 
   import Persistence._
   import Replica._
-  import context.dispatcher
 
   /*
    * The contents of this actor is just a suggestion, you can implement it in any way you like.
    */
   arbiter ! Join
 
-  timers.startTimerAtFixedRate("retryPendingSnapshots", RetryPending, 100 milliseconds)
+  //timers.startTimerAtFixedRate("retryPendingSnapshots", RetryPending, 100 milliseconds)
 
   implicit val timeout = Timeout(1 seconds)
+
+  val persistentService: ActorRef = context.actorOf(persistenceProps)
 
   var kv = Map.empty[String, String]
   // a map from secondary replicas to replicators
@@ -64,105 +65,109 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
 
   var expectedSequence: Long = 0
 
-  var pendingPersistedAck = Map.empty[Long, (ActorRef, Persist)]
-
-  var pendingAcksFromSecondaries = Map.empty[Long, mutable.Set[ActorRef]]
-
-  val persistentService: ActorRef = context.actorOf(persistenceProps)
+  /* message Id for all the messages pending for persistence, and actor ref of the client
+   id -> client
+  * */
+  var pendingPersistedAck = Map.empty[Long, ActorRef]
+  /*  message Id and the replicas we are waiting for ack
+  *  id -> (secondary replicator, client) */
+  var pendingReplicatesAck = Map.empty[Long, mutable.Set[(ActorRef, ActorRef)]]
 
   override val supervisorStrategy: SupervisorStrategy = OneForOneStrategy(withinTimeRange = 1 second) {
     case _: PersistenceException => Resume
   }
 
-  def receive = {
-    case JoinedPrimary   => context.become(leader)
+  override def receive: Receive = {
+    case JoinedPrimary => context.become(leader)
     case JoinedSecondary => context.become(replica)
   }
 
-  /* TODO Behavior for  the leader role. */
   val leader: Receive = {
-    case op: Insert => handleInsert(op, sender())
-    case op: Remove => handleRemove(op, sender)
-    case op: Get => handleGet(op, sender)
+    case msg: Insert => handleUpdateMsg(msg, sender)
+    case msg: Remove => handleUpdateMsg(msg, sender)
+    case msg: Get => handleGet(msg, sender)
+    case msg: Persisted => handlePersistedLeader(msg)
+    case msg: RetryPersistence => handleRetryPersistence(msg)
+    case msg: Replicated => handleReplicated(msg, sender)
+    case msg: CheckGlobalAck => handleCheckGlobalAck(msg)
     case Replicas(replicas) => handleReplicasMsg(replicas)
-    case RetryPending => handleRetryPendingUpdateAcks()
   }
 
-  /* TODO Behavior for the replica role. */
   val replica: Receive = {
     case op: Get => handleGet(op, sender)
     case op: Snapshot if op.seq < expectedSequence =>
-      println("entro")
       sender ! SnapshotAck(op.key, op.seq)
     case op: Snapshot if expectedSequence == op.seq =>
-      println("entro")
       handleSnapshot(op, sender)
-    case RetryPending => retryPendingSnapshotAcks()
+    case op: Persisted => handlePersistedReplica(op)
+    case msg: RetryPersistence => handleRetryPersistence(msg)
   }
 
-  private def handleInsert(op: Insert, sender: ActorRef) = {
-    val persisMsg = Persist(op.key, Some(op.value), op.id)
-    pendingPersistedAck += (op.id -> (sender, persisMsg))
-    persisMsg.valueOption match {
-      case Some(value) => kv += (persisMsg.key -> value)
-      case None => kv -= op.key
+  private def handleUpdateMsg(op: Operation, sender: ActorRef): Unit = {
+    val persistMsg = op match {
+      case Insert(key, value, id) =>
+        kv += (key -> value)
+        Persist(key, Some(value), id)
+      case Remove(key, id) =>
+        kv -= key
+        Persist(key, None, id)
     }
-    (persistentService ? persisMsg).mapTo[Persisted].onComplete {
-      case Failure(ex) =>
-        sender ! OperationFailed(op.id)
-        throw ex
-      case Success(_) =>
-        pendingPersistedAck -= persisMsg.id
-        replicateToSecondaries(persisMsg, sender)
-    }
+    pendingPersistedAck += (persistMsg.id -> sender)
+    pendingPersistedAck += (persistMsg.id -> sender)
+    if (replicators.nonEmpty) pendingReplicatesAck += (persistMsg.id -> replicators.map((_, sender)).to(collection.mutable.Set))
+
+    persistentService ! persistMsg
+    replicateToAllReplicas(op)
+
+    val retryPersistenceMsg = RetryPersistence(persistMsg.key, persistMsg.valueOption, persistMsg.id)
+    timers.startSingleTimer(s"checkGlobalAck+${persistMsg.id}", CheckGlobalAck(persistMsg.id, sender), 1 seconds)
+    timers.startTimerAtFixedRate(s"retryPersistence+${persistMsg.id}", retryPersistenceMsg, 100 milliseconds)
   }
 
-  private def handleRemove(op: Remove, sender: ActorRef) = {
-    val persisMsg = Persist(op.key, None, op.id)
-    pendingPersistedAck += (op.id -> (sender, persisMsg))
-    (persistentService ? persisMsg).mapTo[Persisted].onComplete {
-      case Failure(ex) =>
-        sender ! OperationFailed(op.id)
-        throw ex
-      case Success(_) =>
-        pendingPersistedAck -= op.id
-        kv -= op.key
-        replicateToSecondaries(persisMsg, sender)
+  private def replicateToAllReplicas(op: Operation): Unit = {
+    val replicateMsg = op match {
+      case Insert(key, value, id) => Replicate(key, Some(value), id)
+      case Remove(key, id) => Replicate(key, None, id)
     }
+    replicators foreach (_ ! replicateMsg)
+
   }
 
   private def handleGet(op: Get, sender: ActorRef): Unit = {
     sender ! GetResult(op.key, kv.get(op.key), op.id)
   }
 
-  private def handleSnapshot(op: Snapshot, replicator: ActorRef) = {
+  private def handleRetryPersistence(msg: RetryPersistence): Unit = {
+    persistentService ! Persist(msg.key, msg.value, msg.id)
+  }
+
+  private def handleSnapshot(op: Snapshot, replicator: ActorRef): Unit = {
     op.valueOption match {
       case Some(value) => kv += (op.key -> value)
       case None => kv -= op.key
     }
-    val persistMsg = Persist(op.key, op.valueOption, op.seq)
-    pendingPersistedAck += (op.seq -> (replicator, persistMsg))
-    (persistentService ? persistMsg).mapTo[Persisted] onComplete {
-      case Success(_) =>
-        replicator ! SnapshotAck(op.key, op.seq)
-        expectedSequence += 1
-        pendingPersistedAck -= op.seq
-    }
-
+    pendingPersistedAck += (op.seq -> replicator)
+    persistentService ! Persist(op.key, op.valueOption, op.seq)
+    val retryPersistenceMsg = RetryPersistence(op.key, op.valueOption, op.seq)
+    timers.startTimerAtFixedRate(s"retryPersistence+${op.seq}", retryPersistenceMsg, 100 milliseconds)
   }
 
   private def handleReplicasMsg(replicas: Set[ActorRef]): Unit = {
-    val stoppedReplicas = (secondaries.values.toSet + self).diff(replicas)
-    val newReplicas = replicas.diff(secondaries.values.toSet + self)
+    val stoppedReplicas = (secondaries.keys.toSet + self).diff(replicas)
+    val newReplicas = replicas.diff(secondaries.keys.toSet + self)
 
     //remove stopped replicas and stops their replicator
     stoppedReplicas.foreach { replica =>
       secondaries.get(replica).foreach {
         replicator =>
-          replicator ! PoisonPill
+          secondaries -= replica
+          context.stop(replicator)
           replicators -= replicator
+          pendingReplicatesAck.foreach { case (key, pending) =>
+            pending --= pending.filter { case (client, _) => client == replicator }
+            if (pending.isEmpty) pendingReplicatesAck -= key
+          }
       }
-      secondaries -= replica
     }
 
     //save new replicas and creates their replicator
@@ -176,56 +181,49 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
     }
   }
 
-  private def retryPendingSnapshotAcks(): Unit = {
-    pendingPersistedAck.foreach { case (_, (replicator, persistMsg)) =>
-      (persistentService ? Persist(persistMsg.key, persistMsg.valueOption, persistMsg.id)).mapTo[Persisted] onComplete {
-        case Success(_) =>
-          replicator ! SnapshotAck(persistMsg.key, persistMsg.id)
-          expectedSequence += 1
-          pendingPersistedAck -= persistMsg.id
-        case _=>
+  private def handlePersistedLeader(persisted: Persisted): Unit = {
+    timers.cancel(s"retryPersistence+${persisted.id}")
+    pendingPersistedAck.get(persisted.id) foreach { client =>
+      if (!pendingReplicatesAck.contains(persisted.id)) {
+        timers.cancel(s"checkGlobalAck+${persisted.id}")
+        client ! OperationAck(persisted.id)
       }
     }
+    pendingPersistedAck -= persisted.id
   }
 
-  private def handleRetryPendingUpdateAcks(): Unit = {
-    pendingPersistedAck.foreach { case (_, (replicator, persistMsg)) =>
-      (persistentService ? Persist(persistMsg.key, persistMsg.valueOption, persistMsg.id)).mapTo[Persisted] onComplete {
-        case Success(_) =>
-          replicator ! OperationAck(persistMsg.id)
-          expectedSequence += 1
-          pendingPersistedAck -= persistMsg.id
-      }
+  private def handlePersistedReplica(persisted: Persisted): Unit = {
+    timers.cancel(s"retryPersistence+${persisted.id}")
+    pendingPersistedAck.get(persisted.id) foreach { client =>
+      expectedSequence += 1
+      client ! SnapshotAck(persisted.key, persisted.id)
     }
+    pendingPersistedAck -= persisted.id
   }
 
-  private def replicateToSecondaries(msg: Persist, client: ActorRef): Unit = {
-    if (replicators.isEmpty) client ! OperationAck(msg.id)
-    else {
-      pendingAcksFromSecondaries += (msg.id -> replicators.to(collection.mutable.Set))
-      replicators.foreach { replicator =>
-        (replicator ? Replicate(msg.key, msg.valueOption, msg.id)).mapTo onComplete {
-          case Success(msg) =>
-            println("pasa")
-            handleReplicatedAck(msg, replicator, client)
-          case Failure(_) =>
-            println("rompe")
-            client ! OperationFailed(msg.id)
+  private def handleReplicated(replicated: Replicated, replicator: ActorRef) = {
+    pendingReplicatesAck.get(replicated.id).foreach { pendings =>
+      pendings.find { case (client, _) => client == replicator }
+        .foreach { element =>
+          val client = element._2
+          pendings -= element
+          if (pendings.isEmpty) {
+            timers.cancel(s"checkGlobalAck+${replicated.id}")
+            client ! OperationAck(replicated.id)
+            pendingReplicatesAck -= replicated.id
+          }
         }
-      }
     }
   }
 
-  private def handleReplicatedAck(msg: Replicated, replicator: ActorRef, client: ActorRef): Unit = {
-    pendingAcksFromSecondaries.get(msg.id).foreach { pendingReplicators =>
-      pendingReplicators -= replicator
-      if (pendingReplicators.isEmpty) {
-        pendingAcksFromSecondaries -= msg.id
-        client ! OperationAck(msg.id)
-      }
-    }
+  private def handleCheckGlobalAck(ack: CheckGlobalAck): Unit = {
+    if (pendingReplicatesAck.contains(ack.msgId) || pendingPersistedAck.contains(ack.msgId))
+      ack.client ! OperationFailed(ack.msgId)
+    else ack.client ! OperationAck(ack.msgId)
+    timers.cancel(s"retryPersistence+${ack.msgId}")
+    pendingPersistedAck -= ack.msgId
+    pendingReplicatesAck -= ack.msgId
   }
-
 
 }
 

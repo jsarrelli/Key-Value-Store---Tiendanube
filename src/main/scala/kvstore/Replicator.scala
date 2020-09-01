@@ -1,11 +1,8 @@
 package kvstore
 
 import akka.actor.{Actor, ActorRef, Props, Timers}
-import akka.pattern.ask
-import akka.util.Timeout
 
 import scala.concurrent.duration._
-import scala.util.Success
 
 object Replicator {
 
@@ -17,7 +14,7 @@ object Replicator {
 
   case class SnapshotAck(key: String, seq: Long)
 
-  case object RetryPendingSnapshot
+  case class RetryPendingSnapshot(seq: Long)
 
   def props(replica: ActorRef): Props = Props(new Replicator(replica))
 }
@@ -25,7 +22,6 @@ object Replicator {
 class Replicator(val replica: ActorRef) extends Actor with Timers {
 
   import Replicator._
-  import context.dispatcher
 
   /*
    * The contents of this actor is just a suggestion, you can implement it in any way you like.
@@ -42,39 +38,33 @@ class Replicator(val replica: ActorRef) extends Actor with Timers {
     ret
   }
 
-  timers.startTimerAtFixedRate("retryPendingSnapshots", RetryPendingSnapshot, 100 milliseconds)
-
-
-  /* TODO Behavior for the Replicator. */
   def receive: Receive = {
     case op: Replicate => handleReplicate(op, sender)
     case ack: SnapshotAck => handleSnapshotAck(ack)
-    case RetryPendingSnapshot if pendingAcks.nonEmpty => retryPendingSnapshots()
+    case msg: RetryPendingSnapshot => retryPendingSnapshots(msg)
   }
 
   private def handleReplicate(op: Replicate, client: ActorRef): Unit = {
     val sequence = nextSeq()
     pendingAcks += (sequence -> (client, op))
     replica ! Snapshot(op.key, op.valueOption, sequence)
-    println(s"Sequence del replicate:$sequence")
+    val retryPendingMsg = RetryPendingSnapshot(sequence)
+    timers.startTimerAtFixedRate(s"retryPendingSnapshot-$sequence", retryPendingMsg, 100 milliseconds)
+
   }
 
-  private def retryPendingSnapshots(): Unit = {
-    pendingAcks.foreach { case (sequence, (_, replicateMsg)) =>
-      replica ! Snapshot(replicateMsg.key, replicateMsg.valueOption, sequence)
+  private def retryPendingSnapshots(msg: RetryPendingSnapshot): Unit = {
+    pendingAcks.get(msg.seq) foreach { case (_, replicate) =>
+      replica ! Snapshot(replicate.key, replicate.valueOption, msg.seq)
     }
   }
 
   private def handleSnapshotAck(ack: SnapshotAck): Unit = {
-    println("paso")
-    println(s"Sequence del ack:${ack.seq}")
-
-    pendingAcks.get(ack.seq).foreach { case (client, _) =>
-      println(client)
+    timers.cancel(s"retryPendingSnapshot-${ack.seq}")
+    pendingAcks.get(ack.seq) foreach { case (client, _) =>
       client ! Replicated(ack.key, ack.seq)
-      println("juli")
-      pendingAcks -= ack.seq
     }
+    pendingAcks -= ack.seq
   }
 
 
