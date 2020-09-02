@@ -7,7 +7,7 @@ import akka.event.LoggingReceive
 import kvstore.Arbiter._
 import kvstore.Replicator.{Replicate, Replicated, Snapshot, SnapshotAck}
 
-import scala.collection.{immutable, mutable}
+import scala.collection.mutable
 import scala.concurrent.duration._
 import scala.language.postfixOps
 
@@ -123,6 +123,7 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
     val replicateMsg = op match {
       case Insert(key, value, id) => Replicate(key, Some(value), id)
       case Remove(key, id) => Replicate(key, None, id)
+      case _=> throw new Exception("No hagas boludeces")
     }
     if (replicators.nonEmpty)
       pendingReplicatesAck += (replicateMsg.id -> replicators.map((_, sender)).to(collection.mutable.Set))
